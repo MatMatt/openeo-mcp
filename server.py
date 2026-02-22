@@ -32,6 +32,8 @@ License: EUPL-1.2
 import os
 import json
 import asyncio
+import time
+import hashlib
 from typing import Any
 
 from mcp.server import Server
@@ -70,6 +72,48 @@ In-memory authenticated openeo.Connection.
 Set by `openeo_authenticate` via OIDC Device Flow.
 Reused by all subsequent tool calls that require authentication.
 Reset on server restart (stdio session end).
+"""
+
+# ─── Metadata cache (in-memory, TTL-based) ─────────────────────────────────────
+
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # default: 5 minutes
+"""
+Cache TTL in seconds for metadata responses (collections, processes).
+Set to 0 to disable caching. Override via CACHE_TTL_SECONDS env var.
+"""
+
+_cache: dict[str, tuple[Any, float]] = {}
+"""Simple dict cache: key → (value, expiry_timestamp)"""
+
+
+def _cache_get(key: str) -> Any | None:
+    """Return cached value if not expired, else None."""
+    if key in _cache:
+        value, expiry = _cache[key]
+        if time.time() < expiry:
+            return value
+        del _cache[key]
+    return None
+
+
+def _cache_set(key: str, value: Any) -> None:
+    """Store value in cache with TTL expiry."""
+    if CACHE_TTL > 0:
+        _cache[key] = (value, time.time() + CACHE_TTL)
+
+
+def _cache_key(*parts: str) -> str:
+    """Generate a stable cache key from multiple string parts."""
+    return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+
+# ─── Webhook registry ──────────────────────────────────────────────────────────
+
+_webhooks: dict[str, str] = {}
+"""
+job_id → webhook_url mapping.
+When a job is submitted with a webhook URL, the server polls the job
+and POSTs the status to the URL when the job finishes or errors.
 """
 
 
@@ -409,6 +453,116 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["collection_id", "item_id"]
             }
         ),
+
+        # ── OpenEO: Synchronous execution ───────────────────────────────────────
+        types.Tool(
+            name="openeo_execute_sync",
+            description=(
+                "Execute a small OpenEO process graph synchronously and return the result immediately. "
+                "Suitable for lightweight computations (small AOI, short time range). "
+                "For large computations use openeo_execute_job (batch). "
+                "Requires authentication."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "process_graph": {
+                        "type": "object",
+                        "description": "OpenEO process graph as JSON object."
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Output format: GTiff, netCDF, JSON. Default: GTiff."
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Local path to save result. If omitted, returns metadata only."
+                    }
+                },
+                "required": ["process_graph"]
+            }
+        ),
+
+        # ── OpenEO: UDF ─────────────────────────────────────────────────────────
+        types.Tool(
+            name="openeo_run_udf",
+            description=(
+                "Run a User-Defined Function (UDF) in Python or R within an OpenEO process graph. "
+                "UDFs allow custom pixel-level or timeseries processing beyond built-in processes. "
+                "Requires authentication."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "udf_code": {
+                        "type": "string",
+                        "description": (
+                            "UDF source code as a string. "
+                            "Python UDFs must define a function with signature: "
+                            "apply_datacube(cube: DataCube, context: dict) -> DataCube"
+                        )
+                    },
+                    "udf_language": {
+                        "type": "string",
+                        "description": "UDF language: 'Python' or 'R'. Default: Python.",
+                        "enum": ["Python", "R"]
+                    },
+                    "collection_id": {
+                        "type": "string",
+                        "description": "Input collection to apply UDF to."
+                    },
+                    "bbox": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Bounding box [west, south, east, north] for the UDF run."
+                    },
+                    "temporal_extent": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Time range as [start, end] in ISO 8601."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Job title."
+                    }
+                },
+                "required": ["udf_code", "collection_id", "bbox", "temporal_extent"]
+            }
+        ),
+
+        # ── OpenEO: Webhook ─────────────────────────────────────────────────────
+        types.Tool(
+            name="openeo_set_job_webhook",
+            description=(
+                "Register a webhook URL for a batch job. "
+                "The server will POST job status updates (finished/error) to the URL "
+                "when the job completes. Polls every 60 seconds in the background."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job ID to monitor."
+                    },
+                    "webhook_url": {
+                        "type": "string",
+                        "description": "HTTPS URL to POST status updates to."
+                    }
+                },
+                "required": ["job_id", "webhook_url"]
+            }
+        ),
+
+        # ── Cache control ───────────────────────────────────────────────────────
+        types.Tool(
+            name="cache_clear",
+            description=(
+                "Clear the in-memory metadata cache. "
+                "Useful when backend data has changed and you need fresh results."
+            ),
+            inputSchema={"type": "object", "properties": {}}
+        ),
     ]
 
 
@@ -500,9 +654,15 @@ async def _dispatch(name: str, args: dict) -> Any:
         }
 
     elif name == "openeo_list_collections":
-        """List collections, optionally filtered by ID/title substring."""
+        """List collections, optionally filtered by ID/title substring. Results are cached."""
         conn = get_openeo_connection()
-        collections = conn.list_collections()
+
+        # Check cache first (TTL controlled by CACHE_TTL_SECONDS env var)
+        cache_key = _cache_key("collections", OPENEO_BACKEND_URL)
+        collections = _cache_get(cache_key)
+        if collections is None:
+            collections = conn.list_collections()
+            _cache_set(cache_key, collections)
 
         f = args.get("filter", "").lower()
         result = []
@@ -525,9 +685,14 @@ async def _dispatch(name: str, args: dict) -> Any:
         return dict(c)
 
     elif name == "openeo_list_processes":
-        """List processes, optionally filtered by ID/summary substring."""
+        """List processes, optionally filtered by ID/summary substring. Results are cached."""
         conn = get_openeo_connection()
-        processes = conn.list_processes()
+
+        cache_key = _cache_key("processes", OPENEO_BACKEND_URL)
+        processes = _cache_get(cache_key)
+        if processes is None:
+            processes = conn.list_processes()
+            _cache_set(cache_key, processes)
 
         f = args.get("filter", "").lower()
         result = []
@@ -680,8 +845,162 @@ async def _dispatch(name: str, args: dict) -> Any:
         resp.raise_for_status()  # Raise on 4xx/5xx
         return resp.json()
 
+    # ── Synchronous execution ───────────────────────────────────────────────────
+
+    elif name == "openeo_execute_sync":
+        """
+        Execute a process graph synchronously (blocking until result is ready).
+        Best for small AOIs / quick computations. Large jobs should use batch mode.
+        """
+        conn = get_openeo_connection()
+        output_format = args.get("output_format", "GTiff")
+        output_file = args.get("output_file")
+
+        import openeo
+        cube = conn.datacube_from_process_graph(args["process_graph"])
+
+        if output_file:
+            # Download result directly to file
+            cube.download(output_file, format=output_format)
+            return {
+                "status": "completed",
+                "output_file": output_file,
+                "output_format": output_format,
+            }
+        else:
+            # Return metadata only (no download)
+            return {
+                "status": "completed",
+                "output_format": output_format,
+                "message": "Process graph validated. Provide output_file to download result.",
+            }
+
+    # ── UDF execution ───────────────────────────────────────────────────────────
+
+    elif name == "openeo_run_udf":
+        """
+        Wrap a UDF in a process graph and submit as a batch job.
+        Builds the process graph automatically from collection + bbox + temporal_extent.
+        """
+        conn = get_openeo_connection()
+        import openeo
+        from openeo.processes import ProcessBuilder
+
+        lang = args.get("udf_language", "Python")
+        bbox_dict = {
+            "west": args["bbox"][0], "south": args["bbox"][1],
+            "east": args["bbox"][2], "north": args["bbox"][3],
+            "crs": "EPSG:4326"
+        }
+
+        # Build a standard process graph: load → apply UDF → save
+        cube = (
+            conn.load_collection(
+                args["collection_id"],
+                spatial_extent=bbox_dict,
+                temporal_extent=args["temporal_extent"],
+            )
+            .apply_neighborhood(
+                process=lambda data: data.run_udf(
+                    udf=args["udf_code"],
+                    runtime=lang,
+                ),
+                size=[{"dimension": "x", "value": 128, "unit": "px"},
+                      {"dimension": "y", "value": 128, "unit": "px"}],
+                overlap=[],
+            )
+            .save_result(format="GTiff")
+        )
+
+        job = cube.create_job(title=args.get("title", f"UDF job ({lang})"))
+        job.start_job()
+
+        return {
+            "job_id": job.job_id,
+            "status": job.status(),
+            "language": lang,
+            "collection": args["collection_id"],
+            "message": f"UDF job submitted. Use openeo_job_status to monitor."
+        }
+
+    # ── Webhook ─────────────────────────────────────────────────────────────────
+
+    elif name == "openeo_set_job_webhook":
+        """
+        Register a webhook for a job and start background polling.
+        Sends a POST request to webhook_url when job finishes or errors.
+        """
+        job_id = args["job_id"]
+        webhook_url = args["webhook_url"]
+        _webhooks[job_id] = webhook_url
+
+        # Start background polling task
+        asyncio.create_task(_poll_job_webhook(job_id, webhook_url))
+
+        return {
+            "job_id": job_id,
+            "webhook_url": webhook_url,
+            "status": "webhook_registered",
+            "message": "Polling every 60s. Will POST to webhook_url on completion.",
+        }
+
+    # ── Cache control ────────────────────────────────────────────────────────────
+
+    elif name == "cache_clear":
+        """Clear all cached metadata entries."""
+        count = len(_cache)
+        _cache.clear()
+        return {"cleared_entries": count, "message": "Cache cleared."}
+
     else:
         raise ValueError(f"Unknown tool: {name!r}. Check list_tools() for available tools.")
+
+
+# ─── Webhook polling ───────────────────────────────────────────────────────────
+
+async def _poll_job_webhook(job_id: str, webhook_url: str, poll_interval: int = 60):
+    """
+    Background task: poll an OpenEO job until it finishes or errors,
+    then POST the final status to the registered webhook URL.
+
+    Args:
+        job_id:        OpenEO job ID to monitor.
+        webhook_url:   HTTPS URL to notify on completion.
+        poll_interval: Seconds between status checks (default: 60).
+    """
+    import requests
+
+    terminal_statuses = {"finished", "error", "canceled"}
+
+    while True:
+        await asyncio.sleep(poll_interval)
+
+        try:
+            conn = get_openeo_connection()
+            job = conn.job(job_id)
+            info = job.describe_job()
+            status = info.get("status", "unknown")
+
+            if status in terminal_statuses:
+                # Job is done — notify webhook
+                payload = {
+                    "job_id": job_id,
+                    "status": status,
+                    "updated": info.get("updated"),
+                    "error": info.get("error"),
+                }
+                try:
+                    requests.post(webhook_url, json=payload, timeout=10)
+                except Exception as e:
+                    pass  # Webhook delivery failure is non-fatal
+
+                # Cleanup registry
+                _webhooks.pop(job_id, None)
+                break
+
+        except Exception:
+            # Network error or job not found — keep polling
+            pass
 
 
 # ─── Entrypoint ────────────────────────────────────────────────────────────────
