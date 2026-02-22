@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openeo-mcp"
+version = "0.1.0"
+description = "MCP server for OpenEO and STAC APIs (Copernicus Data Space Ecosystem)"
+authors = [{ name = "Matteo Mattiuzzi" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "openeo>=0.31.0",
+    "pystac-client>=0.8.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+openeo-mcp = "server:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
