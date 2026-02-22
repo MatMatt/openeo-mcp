@@ -18,10 +18,16 @@ OPENEO_TOKEN = os.getenv("OPENEO_TOKEN", "")
 
 server = Server("openeo-mcp")
 
+# ─── Session token store (in-memory, per server instance) ──────────────────────
+_session_connection = None  # authenticated openeo.Connection
+
 # ─── OpenEO helpers ────────────────────────────────────────────────────────────
 
 def get_openeo_connection():
+    global _session_connection
     import openeo
+    if _session_connection is not None:
+        return _session_connection
     conn = openeo.connect(OPENEO_BACKEND_URL)
     if OPENEO_TOKEN:
         conn.authenticate_oidc_access_token(OPENEO_TOKEN)
@@ -36,6 +42,15 @@ def get_stac_client():
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
+        types.Tool(
+            name="openeo_authenticate",
+            description=(
+                "Start OIDC Device Flow login with your CDSE account. "
+                "Returns a URL — open it in your browser to authenticate. "
+                "Once done, all subsequent OpenEO job tools will use your credentials."
+            ),
+            inputSchema={"type": "object", "properties": {}}
+        ),
         types.Tool(
             name="openeo_connect",
             description="Test connection to an OpenEO backend and return its capabilities.",
@@ -237,7 +252,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 async def _dispatch(name: str, args: dict) -> Any:
     # ── OpenEO ──────────────────────────────────────────────────────────────────
-    if name == "openeo_connect":
+    if name == "openeo_authenticate":
+        global _session_connection
+        import openeo
+        conn = openeo.connect(OPENEO_BACKEND_URL)
+        # device_code flow: prints URL, waits for user to authenticate in browser
+        conn.authenticate_oidc_device(
+            client_id="openeo-platform",
+            max_poll_time=300,
+        )
+        _session_connection = conn
+        user_info = conn.describe_account()
+        return {
+            "status": "authenticated",
+            "user": user_info.get("user_id", "unknown"),
+            "backend": OPENEO_BACKEND_URL,
+            "message": "You are now logged in. Job tools will use your CDSE account.",
+        }
+
+    elif name == "openeo_connect":
         url = args.get("backend_url", OPENEO_BACKEND_URL)
         import openeo
         conn = openeo.connect(url)
