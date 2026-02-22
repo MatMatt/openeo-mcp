@@ -28,11 +28,6 @@ jobs:
           pip install pytest pytest-asyncio
 
       - name: Run unit tests
-        run: pytest tests/ -v --ignore=tests/test_server.py -k "not integration"
-        # Note: run all non-integration tests
-        continue-on-error: false
-
-      - name: Run unit tests (full)
         run: pytest tests/ -v -m "not integration"
 
   lint:
