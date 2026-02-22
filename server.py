@@ -830,7 +830,7 @@ async def _dispatch(name: str, args: dict) -> Any:
             "description": c.description,
             "extent": c.extent.to_dict() if c.extent else None,  # spatial + temporal extent
             "license": c.license,
-            "links": [{"rel": l.rel, "href": l.href} for l in c.links[:10]],
+            "links": [{"rel": lnk.rel, "href": lnk.href} for lnk in c.links[:10]],
         }
 
     elif name == "stac_get_item":
@@ -884,7 +884,6 @@ async def _dispatch(name: str, args: dict) -> Any:
         """
         conn = get_openeo_connection()
         import openeo
-        from openeo.processes import ProcessBuilder
 
         lang = args.get("udf_language", "Python")
         bbox_dict = {
@@ -920,7 +919,7 @@ async def _dispatch(name: str, args: dict) -> Any:
             "status": job.status(),
             "language": lang,
             "collection": args["collection_id"],
-            "message": f"UDF job submitted. Use openeo_job_status to monitor."
+            "message": "UDF job submitted. Use openeo_job_status to monitor."
         }
 
     # ── Webhook ─────────────────────────────────────────────────────────────────
@@ -991,7 +990,7 @@ async def _poll_job_webhook(job_id: str, webhook_url: str, poll_interval: int = 
                 }
                 try:
                     requests.post(webhook_url, json=payload, timeout=10)
-                except Exception as e:
+                except Exception:
                     pass  # Webhook delivery failure is non-fatal
 
                 # Cleanup registry

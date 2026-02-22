@@ -14,8 +14,7 @@ Run all including integration:
 
 import pytest
 import asyncio
-import json
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────────
